@@ -3282,7 +3282,7 @@ async def _safe_fetch(label: str, awaitable):
         return None
 
 
-def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCachedObj:
+def team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCachedObj:
     """Reconstruct a cached team object from the fields already on the
     UserAPIKeyAuth. Only called when valid_token.team_id is known to be
     non-None (the caller gates on it)."""
@@ -3304,7 +3304,7 @@ def _team_obj_from_token(valid_token: UserAPIKeyAuth) -> LiteLLM_TeamTableCached
     )
 
 
-def _token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseException) -> bool:
+def token_can_vouch_for_team(valid_token: UserAPIKeyAuth, lookup_error: BaseException) -> bool:
     """Whether the token's own team fields may stand in for a team that failed to
     resolve, without widening access.
 
@@ -3675,16 +3675,16 @@ async def run_centralized_common_checks(
     team_object: LiteLLM_TeamTableCachedObj | None
     if isinstance(team_result, BaseException):
         # Token-derived fallback only valid when a team_id is set;
-        # _team_obj_from_token asserts that precondition.
+        # team_obj_from_token asserts that precondition.
         if user_api_key_auth_obj.team_id is None:
             team_object = None
-        elif _token_can_vouch_for_team(user_api_key_auth_obj, team_result):
-            team_object = _team_obj_from_token(user_api_key_auth_obj)
+        elif token_can_vouch_for_team(user_api_key_auth_obj, team_result):
+            team_object = team_obj_from_token(user_api_key_auth_obj)
         else:
             raise team_result
     else:
         team_object = (
-            _team_obj_from_token(user_api_key_auth_obj) if user_api_key_auth_obj.team_id == UI_TEAM_ID else team_result
+            team_obj_from_token(user_api_key_auth_obj) if user_api_key_auth_obj.team_id == UI_TEAM_ID else team_result
         )
 
     user_object: LiteLLM_UserTable | None = user_result if isinstance(user_result, LiteLLM_UserTable) else None

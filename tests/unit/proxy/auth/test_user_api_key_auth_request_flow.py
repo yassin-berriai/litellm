@@ -6572,7 +6572,7 @@ async def test_centralized_common_checks_master_key_admin_overrides_db_user_role
 async def test_centralized_common_checks_http_exception_without_team_id():
     """Regression: an HTTPException raised by any of the five parallel
     fetches (user/project/end_user/global_spend) must not trigger the
-    _team_obj_from_token reconstruction when the token has no team_id —
+    team_obj_from_token reconstruction when the token has no team_id —
     the helper asserts team_id is not None. This is the Greptile P1
     finding: the ``except HTTPException`` arm was team-fetch-biased."""
     import litellm.proxy.proxy_server as _proxy_server_mod
@@ -6601,7 +6601,7 @@ async def test_centralized_common_checks_http_exception_without_team_id():
                 new_callable=AsyncMock,
             ) as mock_checks,
         ):
-            # Should NOT raise AssertionError from _team_obj_from_token;
+            # Should NOT raise AssertionError from team_obj_from_token;
             # should proceed with team_object=None.
             await run_centralized_common_checks(
                 user_api_key_auth_obj=token,

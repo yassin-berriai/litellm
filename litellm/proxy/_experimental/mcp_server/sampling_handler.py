@@ -30,7 +30,9 @@ if typing.TYPE_CHECKING:
     )
 
     from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+    from litellm.models.team import LiteLLM_TeamTableCachedObj
     from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.utils import PrismaClient, ProxyLogging, UserApiKeyCache
     from litellm.types.utils import ModelResponse
 
 from fastapi import HTTPException
@@ -898,6 +900,37 @@ async def _check_model_access(model: str, user_api_key_auth: "UserAPIKeyAuth | N
         )
 
 
+async def _resolve_sampling_team_object(
+    user_api_key_auth: "UserAPIKeyAuth",
+    prisma_client: "PrismaClient",
+    user_api_key_cache: "UserApiKeyCache",
+    proxy_logging_obj: "ProxyLogging",
+) -> "LiteLLM_TeamTableCachedObj | ErrorData | None":
+    team_id: Final[str | None] = user_api_key_auth.team_id
+    if team_id is None:
+        return None
+
+    from litellm.proxy.auth.auth_checks import get_team_object
+    from litellm.proxy.auth.user_api_key_auth import team_obj_from_token, token_can_vouch_for_team
+
+    try:
+        return await get_team_object(
+            team_id=team_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except Exception as team_err:
+        if token_can_vouch_for_team(user_api_key_auth, team_err):
+            return team_obj_from_token(user_api_key_auth)
+        verbose_logger.warning(
+            "MCP sampling: team lookup failed for team_id=%s: %s",
+            team_id,
+            team_err,
+        )
+        return ErrorData(code=-1, message=f"Sampling denied: {team_err}")
+
+
 async def _run_budget_checks(
     model: str,
     user_api_key_auth: "UserAPIKeyAuth",
@@ -915,7 +948,6 @@ async def _run_budget_checks(
         import litellm
         from litellm.proxy.auth.auth_checks import (
             common_checks,
-            get_team_object,
             get_user_object,
         )
         from litellm.proxy.proxy_server import (
@@ -940,17 +972,18 @@ async def _run_budget_checks(
     _team_id: Final[str | None] = getattr(user_api_key_auth, "team_id", None)
     _user_id: Final[str | None] = getattr(user_api_key_auth, "user_id", None)
 
-    team_obj = None
-    if _team_id and _prisma_client and _user_api_key_cache:
-        try:
-            team_obj = await get_team_object(
-                team_id=_team_id,
-                prisma_client=_prisma_client,
-                user_api_key_cache=_user_api_key_cache,
-                proxy_logging_obj=_proxy_logging_obj,
-            )
-        except Exception:
-            pass
+    team_result: Final = (
+        await _resolve_sampling_team_object(
+            user_api_key_auth=user_api_key_auth,
+            prisma_client=_prisma_client,
+            user_api_key_cache=_user_api_key_cache,
+            proxy_logging_obj=_proxy_logging_obj,
+        )
+        if _team_id and _prisma_client and _user_api_key_cache
+        else None
+    )
+    if isinstance(team_result, ErrorData):
+        return team_result
 
     user_obj = None
     if _user_id and _prisma_client and _user_api_key_cache:
@@ -1015,7 +1048,7 @@ async def _run_budget_checks(
     try:
         await common_checks(
             request_body=request_body,
-            team_object=team_obj,
+            team_object=team_result,
             user_object=user_obj,
             end_user_object=None,
             global_proxy_spend=global_proxy_spend,

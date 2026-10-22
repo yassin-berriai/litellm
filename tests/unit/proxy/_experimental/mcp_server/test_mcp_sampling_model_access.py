@@ -7,12 +7,22 @@ calls, preventing a malicious upstream MCP server from requesting
 inference on models the caller's API key is not authorized to use.
 """
 
-import pytest
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
+from mcp.types import ErrorData
+
+from litellm.caching.dual_cache import DualCache
+from litellm.models.team import LiteLLM_TeamTableCachedObj
+from litellm.models.user import LiteLLM_UserTable
 from litellm.proxy._experimental.mcp_server.sampling_handler import (
     _check_model_access,
+    _run_budget_checks,
 )
+from litellm.proxy._types import UI_TEAM_ID, UserAPIKeyAuth
+from litellm.proxy.auth.auth_checks import TeamNotFoundError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -297,7 +307,6 @@ class TestSamplingAuthAndBudgetGating:
     @pytest.mark.asyncio
     async def test_should_deny_over_budget_caller(self):
         """When _run_budget_checks returns ErrorData, sampling must return it."""
-        from mcp.types import ErrorData
         from litellm.proxy._experimental.mcp_server.sampling_handler import (
             handle_sampling_create_message,
         )
@@ -341,3 +350,146 @@ class TestSamplingAuthAndBudgetGating:
 
         assert result is budget_error
         assert "ExceededBudget" in result.message
+
+
+async def _run_budget_checks_for_team(
+    *,
+    team_id: str | None = "t1",
+    team_models: list[str] | None = None,
+    team_max_budget: float | None = None,
+    team_spend: float | None = None,
+    team_lookup_error: Exception | None = None,
+    team_object: LiteLLM_TeamTableCachedObj | None = None,
+    general_settings: dict[str, object] | None = None,
+) -> ErrorData | None:
+    auth: Final = UserAPIKeyAuth(
+        api_key="sk-sampling-test",
+        token="hashed",
+        user_id="u1",
+        team_id=team_id,
+        team_models=team_models if team_models is not None else [],
+        team_max_budget=team_max_budget,
+        team_spend=team_spend,
+    )
+    prisma_client: Final = MagicMock()
+    prisma_client.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
+    proxy_logging_obj: Final = MagicMock()
+    proxy_logging_obj.budget_alerts = AsyncMock()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", new=prisma_client),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", new=DualCache()),
+        patch("litellm.proxy.proxy_server.proxy_logging_obj", new=proxy_logging_obj),
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            new=general_settings or {},
+        ),
+        patch("litellm.proxy.proxy_server.llm_router", new=None),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_team_object",
+            new_callable=AsyncMock,
+            side_effect=team_lookup_error,
+            return_value=team_object,
+        ),
+        patch(
+            "litellm.proxy.auth.auth_checks.get_user_object",
+            new_callable=AsyncMock,
+            return_value=LiteLLM_UserTable(user_id="u1", max_budget=1.0, spend=5.0),
+        ),
+        patch(
+            "litellm.proxy.proxy_server.get_current_spend",
+            new_callable=AsyncMock,
+            side_effect=lambda **kwargs: kwargs["fallback_spend"],
+        ),
+    ):
+        return await _run_budget_checks("gpt-4o", auth)
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_uses_vouched_team_context_instead_of_personal_budget():
+    result: Final = await _run_budget_checks_for_team(
+        team_models=["gpt-4o"],
+        team_max_budget=100.0,
+        team_spend=0.0,
+        team_lookup_error=HTTPException(status_code=404),
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_enforces_vouched_team_budget():
+    result: Final = await _run_budget_checks_for_team(
+        team_models=["gpt-4o"],
+        team_max_budget=10.0,
+        team_spend=50.0,
+        team_lookup_error=HTTPException(status_code=404),
+    )
+
+    assert (
+        result is not None
+        and "Team=t1" in result.message
+        and "Max budget: 10.0" in result.message
+        and "User=u1" not in result.message
+    )
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_rejects_team_not_found_without_personal_budget_denial():
+    result: Final = await _run_budget_checks_for_team(
+        team_models=["gpt-4o"],
+        team_lookup_error=TeamNotFoundError(team_id="t1"),
+    )
+
+    assert result is not None and "t1" in result.message and "User=u1" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_denies_without_db_unavailable_fallback_setting():
+    result: Final = await _run_budget_checks_for_team(
+        team_lookup_error=HTTPException(status_code=404),
+    )
+
+    assert result is not None and "Sampling denied:" in result.message and "User=u1" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_allows_with_db_unavailable_fallback_setting():
+    result: Final = await _run_budget_checks_for_team(
+        team_lookup_error=HTTPException(status_code=404),
+        general_settings={"allow_requests_on_db_unavailable": True},
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_vouches_for_ui_team_after_team_not_found():
+    result: Final = await _run_budget_checks_for_team(
+        team_id=UI_TEAM_ID,
+        team_lookup_error=TeamNotFoundError(team_id=UI_TEAM_ID),
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_keeps_personal_key_budget_enforcement():
+    result: Final = await _run_budget_checks_for_team(team_id=None)
+
+    assert result is not None and "User=u1" in result.message
+
+
+@pytest.mark.asyncio
+async def test_sampling_budget_accepts_resolved_team_under_budget():
+    result: Final = await _run_budget_checks_for_team(
+        team_models=["gpt-4o"],
+        team_object=LiteLLM_TeamTableCachedObj(
+            team_id="t1",
+            models=["gpt-4o"],
+            max_budget=100.0,
+            spend=0.0,
+        ),
+    )
+
+    assert result is None
