@@ -12,7 +12,7 @@ import copy
 import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import Final
+from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +23,7 @@ from litellm import Router
 from litellm.proxy.management_endpoints.fallback_management_endpoints import (
     FallbackCreateRequest,
     FallbackDeleteResponse,
+    FallbackGetResponse,
     FallbackResponse,
     create_fallback,
     delete_fallback,
@@ -379,6 +380,88 @@ class TestFallbackWritesSeeTheLatestStoredRules:
         await self._create(FallbackCreateRequest(model="gpt-5.4-mini", fallback_models=["team-fallback"]), stored)
 
         assert stored.stored_fallbacks() == [GATEWAY_RULE]
+
+
+class TestFallbackReadsSeeTheLatestStoredRules:
+    @pytest.fixture(autouse=True)
+    async def clean_config_cache(self) -> AsyncIterator[None]:
+        await evict_config_param("router_settings")
+        yield
+        await evict_config_param("router_settings")
+
+    async def _get(
+        self,
+        model: str,
+        fallback_type: Literal["general", "context_window", "content_policy"],
+        stored: _StoredRouterSettings,
+        router: Router,
+    ) -> FallbackGetResponse:
+        with (
+            patch("litellm.proxy.proxy_server.llm_router", router),
+            patch("litellm.proxy.proxy_server.prisma_client", stored.prisma_client),
+            patch("litellm.proxy.proxy_server.proxy_config", stored.proxy_config),
+            patch("litellm.proxy.proxy_server.store_model_in_db", True),
+        ):
+            return await get_fallback(model, fallback_type, MagicMock())
+
+    async def test_read_sees_a_fallback_written_by_another_instance(self) -> None:
+        stored: Final = _StoredRouterSettings({})
+        await get_config_param(stored.prisma_client, "router_settings")
+        stored.written_by_another_instance({"fallbacks": [TEAM_RULE]})
+        router: Final = _team_router()
+        router.fallbacks = []
+
+        response: Final = await self._get("team-primary", "general", stored, router)
+
+        assert response.fallback_models == ["team-fallback"]
+
+    async def test_read_resolves_non_standard_rules_stored_by_another_instance(self) -> None:
+        stored: Final = _StoredRouterSettings({})
+        await get_config_param(stored.prisma_client, "router_settings")
+        stored.written_by_another_instance({"fallbacks": [*NON_STANDARD_RULES, TEAM_RULE]})
+        router: Final = _team_router()
+        router.fallbacks = []
+
+        response: Final = await self._get("team-primary", "general", stored, router)
+
+        assert response.fallback_models == ["team-fallback"]
+
+    async def test_read_resolves_a_wildcard_rule_stored_by_another_instance(self) -> None:
+        stored: Final = _StoredRouterSettings({})
+        await get_config_param(stored.prisma_client, "router_settings")
+        stored.written_by_another_instance({"fallbacks": [{"*": ["team-fallback"]}]})
+        router: Final = _team_router()
+        router.fallbacks = []
+
+        response: Final = await self._get("team-primary", "general", stored, router)
+
+        assert response.fallback_models == ["team-fallback"]
+
+    async def test_read_does_not_return_a_fallback_deleted_by_another_instance(self) -> None:
+        stored: Final = _StoredRouterSettings({"fallbacks": [TEAM_RULE]})
+        await get_config_param(stored.prisma_client, "router_settings")
+        stored.written_by_another_instance({"fallbacks": []})
+        router: Final = _team_router()
+        router.fallbacks = [TEAM_RULE]
+
+        with pytest.raises(HTTPException) as exc_info:
+            await self._get("team-primary", "general", stored, router)
+
+        assert exc_info.value.status_code == 404
+
+    async def test_read_uses_the_requested_fallback_type(self) -> None:
+        stored: Final = _StoredRouterSettings({})
+        await get_config_param(stored.prisma_client, "router_settings")
+        stored.written_by_another_instance({"context_window_fallbacks": [TEAM_RULE]})
+        router: Final = _team_router()
+
+        response: Final = await self._get("team-primary", "context_window", stored, router)
+
+        assert response.fallback_models == ["team-fallback"]
+        with pytest.raises(HTTPException) as exc_info:
+            await self._get("team-primary", "general", stored, router)
+
+        assert exc_info.value.status_code == 404
 
 
 CONFIG_RULE: Final = {"gpt-5.4-mini": ["team-fallback"]}

@@ -21,6 +21,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.model_checks import get_all_fallbacks
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.utils import PrismaClient, evict_config_param, invalidate_config_param
+from litellm.router_utils.fallback_event_handlers import get_fallback_model_group
 
 if TYPE_CHECKING:
     from fastapi import APIRouter, Depends, HTTPException, status
@@ -54,10 +55,36 @@ def _rule_covers(entry: StoredFallback, model: str) -> bool:
     return isinstance(entry, dict) and model in entry
 
 
+def _fallback_key(
+    fallback_type: Literal["general", "context_window", "content_policy"],
+) -> Literal["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"]:
+    if fallback_type == "context_window":
+        return "context_window_fallbacks"
+    if fallback_type == "content_policy":
+        return "content_policy_fallbacks"
+    return "fallbacks"
+
+
 async def _router_settings_fresh_from_db(proxy_config: "ProxyConfig") -> dict[str, object]:
     await evict_config_param(ROUTER_SETTINGS_PARAM)
     config: Final = await proxy_config.get_config()
     return config.get(ROUTER_SETTINGS_PARAM, {})
+
+
+async def _fallback_models_from_db(
+    proxy_config: "ProxyConfig",
+    fallback_key: Literal["fallbacks", "context_window_fallbacks", "content_policy_fallbacks"],
+    model: str,
+) -> tuple[str, ...]:
+    router_settings: Final = await _router_settings_fresh_from_db(proxy_config)
+    stored_rules: Final = _STORED_FALLBACKS.validate_python(router_settings.get(fallback_key) or [])
+    result: Final = get_fallback_model_group(
+        fallbacks=(
+            stored_rules  # pyright: ignore[reportArgumentType]  # resolver accepts legacy strings and dictionaries
+        ),
+        model_group=model,
+    )
+    return tuple(result[0] or ())
 
 
 def _reject_config_owned_rules(proxy_config: "ProxyConfig", fallback_key: str, rules: Sequence[StoredFallback]) -> None:
@@ -165,11 +192,7 @@ async def create_fallback(
         router_settings: Final = await _router_settings_fresh_from_db(proxy_config)
 
         # Get the appropriate fallback list based on type
-        fallback_key = "fallbacks"
-        if data.fallback_type == "context_window":
-            fallback_key = "context_window_fallbacks"
-        elif data.fallback_type == "content_policy":
-            fallback_key = "content_policy_fallbacks"
+        fallback_key: Final = _fallback_key(data.fallback_type)
 
         # Get existing fallbacks
         existing_fallbacks: Final = _STORED_FALLBACKS.validate_python(router_settings.get(fallback_key) or [])
@@ -241,7 +264,7 @@ async def get_fallback(
     GET /fallback/gpt-3.5-turbo?fallback_type=general
     ```
     """
-    from litellm.proxy.proxy_server import llm_router
+    from litellm.proxy.proxy_server import llm_router, prisma_client, proxy_config, store_model_in_db
 
     try:
         if llm_router is None:
@@ -250,8 +273,11 @@ async def get_fallback(
                 detail={"error": "Router not initialized"},
             )
 
-        # Get fallbacks using the existing utility function
-        fallback_models: Final = get_all_fallbacks(model=model, llm_router=llm_router, fallback_type=fallback_type)
+        fallback_models: Final = (
+            await _fallback_models_from_db(proxy_config, _fallback_key(fallback_type), model)
+            if store_model_in_db is True and prisma_client is not None
+            else tuple(get_all_fallbacks(model=model, llm_router=llm_router, fallback_type=fallback_type))
+        )
 
         if not fallback_models:
             raise HTTPException(
@@ -261,7 +287,7 @@ async def get_fallback(
 
         return FallbackGetResponse(
             model=model,
-            fallback_models=fallback_models,
+            fallback_models=list(fallback_models),
             fallback_type=fallback_type,
         )
 
@@ -323,11 +349,7 @@ async def delete_fallback(
         router_settings: Final = await _router_settings_fresh_from_db(proxy_config)
 
         # Get the appropriate fallback list based on type
-        fallback_key = "fallbacks"
-        if fallback_type == "context_window":
-            fallback_key = "context_window_fallbacks"
-        elif fallback_type == "content_policy":
-            fallback_key = "content_policy_fallbacks"
+        fallback_key: Final = _fallback_key(fallback_type)
 
         # Get existing fallbacks
         existing_fallbacks: Final = _STORED_FALLBACKS.validate_python(router_settings.get(fallback_key) or [])
