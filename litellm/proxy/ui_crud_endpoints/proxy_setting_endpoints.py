@@ -671,16 +671,16 @@ async def add_allowed_ip(
     if prisma_client is None:
         raise Exception("No DB Connected")
 
-    _allowed_ips: Final[Sequence[str]] = general_settings.get("allowed_ips") or ()
-    if ip_address.ip in _allowed_ips:
-        raise HTTPException(status_code=400, detail="IP address already exists")
-    _store_allowed_ips(general_settings, (*_allowed_ips, ip_address.ip))
-
     if store_model_in_db is not True:
         raise HTTPException(
             status_code=500,
             detail={"error": "Set `'STORE_MODEL_IN_DB='True'` in your env to enable this feature."},
         )
+
+    _allowed_ips: Final[Sequence[str]] = general_settings.get("allowed_ips") or ()
+    if ip_address.ip in _allowed_ips:
+        raise HTTPException(status_code=400, detail="IP address already exists")
+    _store_allowed_ips(general_settings, (*_allowed_ips, ip_address.ip))
 
     # Load existing config
     config: Final = await proxy_config.get_config()
@@ -726,7 +726,14 @@ async def delete_allowed_ip(
         create_config_audit_log,
         general_settings,
         proxy_config,
+        store_model_in_db,
     )
+
+    if store_model_in_db is not True:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Set `'STORE_MODEL_IN_DB='True'` in your env to enable this feature."},
+        )
 
     _allowed_ips: Final[Sequence[str]] = general_settings.get("allowed_ips") or ()
     if ip_address.ip not in _allowed_ips:
