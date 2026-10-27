@@ -51,6 +51,30 @@ run "default_creates_everything" {
     condition     = length(local.shared_env_kv) == 12
     error_message = "The default runtime environment must include GCS and the three Redis TLS entries."
   }
+
+  assert {
+    condition     = length([for e in google_cloud_run_v2_service.gateway[0].template[0].containers[0].env : e if e.name == "STORE_MODEL_IN_DB"]) == 1
+    error_message = "STORE_MODEL_IN_DB must reach the gateway when Cloud SQL is configured."
+  }
+}
+
+run "store_model_in_db_extra_env_overrides_defaults" {
+  command = plan
+
+  variables {
+    gateway_extra_env = { STORE_MODEL_IN_DB = "True" }
+    backend_extra_env = { STORE_MODEL_IN_DB = "True" }
+  }
+
+  assert {
+    condition = alltrue([
+      length([for e in google_cloud_run_v2_service.gateway[0].template[0].containers[0].env : e if e.name == "STORE_MODEL_IN_DB"]) == 1,
+      try(one([for e in google_cloud_run_v2_service.gateway[0].template[0].containers[0].env : e if e.name == "STORE_MODEL_IN_DB"]).value, "") == "True",
+      length([for e in google_cloud_run_v2_service.backend[0].template[0].containers[0].env : e if e.name == "STORE_MODEL_IN_DB"]) == 1,
+      try(one([for e in google_cloud_run_v2_service.backend[0].template[0].containers[0].env : e if e.name == "STORE_MODEL_IN_DB"]).value, "") == "True",
+    ])
+    error_message = "Caller STORE_MODEL_IN_DB values must override defaults without duplicate entries in either service."
+  }
 }
 
 run "deps_only_creates_no_runtime" {

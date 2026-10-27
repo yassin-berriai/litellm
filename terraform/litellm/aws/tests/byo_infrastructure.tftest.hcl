@@ -52,6 +52,31 @@ run "module_owns_everything_by_default" {
     condition     = length(terraform_data.bootstrap_db) == 1 && length(aws_ecs_task_definition.migrations) == 1
     error_message = "The IAM-user bootstrap and the schema migration must both run against the module-created Aurora."
   }
+
+  assert {
+    condition     = length([for e in local.gateway_environment : e if e.name == "STORE_MODEL_IN_DB"]) == 1
+    error_message = "STORE_MODEL_IN_DB must reach the gateway when the module creates a database."
+  }
+}
+
+run "store_model_in_db_extra_env_overrides_defaults" {
+  command = plan
+
+  variables {
+    azs               = ["us-east-1a", "us-east-1b"]
+    gateway_extra_env = { STORE_MODEL_IN_DB = "True" }
+    backend_extra_env = { STORE_MODEL_IN_DB = "True" }
+  }
+
+  assert {
+    condition = alltrue([
+      length([for e in local.gateway_environment : e if e.name == "STORE_MODEL_IN_DB"]) == 1,
+      try(one([for e in local.gateway_environment : e if e.name == "STORE_MODEL_IN_DB"]).value, "") == "True",
+      length([for e in concat(local.backend_default_env, local.backend_extra_env_list) : e if e.name == "STORE_MODEL_IN_DB"]) == 1,
+      try(one([for e in concat(local.backend_default_env, local.backend_extra_env_list) : e if e.name == "STORE_MODEL_IN_DB"]).value, "") == "True",
+    ])
+    error_message = "Caller STORE_MODEL_IN_DB values must override defaults without duplicate entries in either task."
+  }
 }
 
 run "existing_vpc_creates_no_networking" {
@@ -264,6 +289,11 @@ run "no_database_and_no_redis_drops_the_schema_migration" {
   assert {
     condition     = length(local.backend_default_env) == 0
     error_message = "STORE_MODEL_IN_DB must not be set without a database to store models in."
+  }
+
+  assert {
+    condition     = length([for e in local.gateway_environment : e if e.name == "STORE_MODEL_IN_DB"]) == 0
+    error_message = "STORE_MODEL_IN_DB must not reach the gateway without a database."
   }
 
   assert {

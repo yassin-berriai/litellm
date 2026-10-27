@@ -177,11 +177,17 @@ locals {
     for k, v in var.backend_extra_env : { name = k, value = v }
   ]
 
-  # Storing models in the DB needs a DB. Without one the backend reads its
-  # model list from proxy_config only.
-  backend_default_env = local.database_enabled ? [
+  # Without a database, both the gateway and backend read models from
+  # proxy_config only.
+  store_model_in_db_env = local.database_enabled ? [
     { name = "STORE_MODEL_IN_DB", value = "true" },
   ] : []
+  gateway_default_env = [
+    for e in local.store_model_in_db_env : e if !contains(keys(var.gateway_extra_env), e.name)
+  ]
+  backend_default_env = [
+    for e in local.store_model_in_db_env : e if !contains(keys(var.backend_extra_env), e.name)
+  ]
   gateway_extra_secrets_list = [
     for k, v in var.gateway_extra_secrets : { name = k, valueFrom = v }
   ]
@@ -290,6 +296,7 @@ locals {
 
   gateway_environment = concat(
     local.shared_env,
+    local.gateway_default_env,
     local.gateway_otel_env,
     local.billing_metrics_env,
     local.gateway_extra_env_list,

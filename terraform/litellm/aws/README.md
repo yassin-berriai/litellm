@@ -134,9 +134,12 @@ gateway_extra_env = {
   LANGFUSE_HOST = "https://us.cloud.langfuse.com"
 }
 backend_extra_env = {
-  STORE_MODEL_IN_DB = "True"
+  UI_USERNAME = "admin"
 }
 ```
+
+With a database, the module sets `STORE_MODEL_IN_DB=true` on both the gateway
+and the backend.
 
 ### Extra secrets (API keys)
 

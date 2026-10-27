@@ -116,8 +116,14 @@ locals {
     for k, v in var.backend_extra_env : { name = k, value = v }
   ]
 
-  backend_default_env_kv = [
+  store_model_in_db_env_kv = [
     { name = "STORE_MODEL_IN_DB", value = "true" },
+  ]
+  gateway_default_env_kv = [
+    for e in local.store_model_in_db_env_kv : e if !contains(keys(var.gateway_extra_env), e.name)
+  ]
+  backend_default_env_kv = [
+    for e in local.store_model_in_db_env_kv : e if !contains(keys(var.backend_extra_env), e.name)
   ]
   gateway_extra_secret_kv = [
     for k, v in var.gateway_extra_secrets : { name = k, secret = v, version = "latest" }
@@ -186,7 +192,7 @@ locals {
     { name = "LITELLM_COLLECTOR_DRAIN_TIMEOUT_SECONDS", value = tostring(var.collector_drain_timeout_seconds) },
   ] : []
 
-  gateway_env_kv      = concat(local.shared_env_kv, local.gateway_otel_env_kv, local.billing_metrics_env_kv, local.gateway_extra_env_kv, local.proxy_config_env, local.metrics_env_kv, local.gateway_pool_env, local.collector_env_kv)
+  gateway_env_kv      = concat(local.shared_env_kv, local.gateway_default_env_kv, local.gateway_otel_env_kv, local.billing_metrics_env_kv, local.gateway_extra_env_kv, local.proxy_config_env, local.metrics_env_kv, local.gateway_pool_env, local.collector_env_kv)
   gateway_env_secrets = concat(local.shared_env_secrets, local.otel_env_secrets, local.billing_metrics_env_secrets, local.gateway_extra_secret_kv)
 
   collector_env_kv_all = concat(
