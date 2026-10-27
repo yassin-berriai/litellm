@@ -85,6 +85,7 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.sso_assertion_s
 )
 from litellm.proxy._types import (
     CommonProxyErrors,
+    LiteLLM_JWTAuth,
     LiteLLM_UserTable,
     LitellmUserRoles,
     Member,
@@ -1841,6 +1842,38 @@ async def add_missing_team_member(user_info: NewUserResponse | LiteLLM_UserTable
         verbose_proxy_logger.debug("[Non-Blocking] Error trying to add sso user to db: %s", e)
 
 
+async def remove_stale_team_members(
+    user_info: NewUserResponse | LiteLLM_UserTable,
+    sso_teams: Sequence[str],
+    litellm_jwtauth: LiteLLM_JWTAuth | None,
+) -> None:
+    if (
+        litellm_jwtauth is None
+        or not litellm_jwtauth.sync_user_role_and_teams
+        or user_info.user_id is None
+        or (litellm_jwtauth.fallback_to_db_teams and not sso_teams)
+    ):
+        return
+
+    stale_teams: Final = sorted(frozenset(user_info.teams or ()) - frozenset(sso_teams))
+    if not stale_teams:
+        return
+
+    from litellm.proxy.management_endpoints.scim.scim_v2 import patch_team_membership
+
+    membership_updated: Final = await patch_team_membership(
+        user_id=user_info.user_id,
+        teams_ids_to_add_user_to=[],
+        teams_ids_to_remove_user_from=stale_teams,
+    )
+    if not membership_updated:
+        verbose_proxy_logger.warning(
+            "Failed to remove stale teams %s from user %s",
+            stale_teams,
+            user_info.user_id,
+        )
+
+
 def get_disabled_non_admin_personal_key_creation():
     key_generation_settings: Final = litellm.key_generation_settings
     if key_generation_settings is None:
@@ -1895,6 +1928,7 @@ async def get_user_info_from_db(
     user_email: str | None,
     user_defined_values: SSOUserDefinedValues | None,
     alternate_user_id: str | None = None,
+    litellm_jwtauth: LiteLLM_JWTAuth | None = None,
 ) -> LiteLLM_UserTable | NewUserResponse | None:
     mapped_user_id: Final = None if user_defined_values is None else user_defined_values.get("user_id")
     resolved_by_database_only: Final = user_defined_values is not None and (
@@ -1941,6 +1975,7 @@ async def get_user_info_from_db(
         await SSOAuthenticationHandler.add_user_to_teams_from_sso_response(
             result=result,
             user_info=user_info,
+            litellm_jwtauth=litellm_jwtauth,
         )
 
         return user_info
@@ -2440,6 +2475,7 @@ async def _complete_cli_sso_callback_session(
     user_api_key_cache: UserApiKeyCache,
     cli_sso_session_cache: DualCache,
     proxy_logging_obj: ProxyLogging,
+    litellm_jwtauth: LiteLLM_JWTAuth | None = None,
     prefill_user_code: str | None = None,
     sso_assertion: SSOIdentityAssertion | None = None,
 ):
@@ -2457,6 +2493,7 @@ async def _complete_cli_sso_callback_session(
         user_email=user_email,
         user_defined_values=user_defined_values,
         alternate_user_id=user_id,
+        litellm_jwtauth=litellm_jwtauth,
     )
     if user_info is None:
         if user_defined_values is not None:
@@ -2540,10 +2577,13 @@ async def cli_sso_callback(
     from litellm.proxy.proxy_server import (
         cli_sso_session_cache,
         general_settings,
+        jwt_handler,
         prisma_client,
         proxy_logging_obj,
         user_api_key_cache,
     )
+
+    litellm_jwtauth: Final[LiteLLM_JWTAuth | None] = getattr(jwt_handler, "litellm_jwtauth", None)
 
     flow: Final = _get_cli_sso_flow_or_raise(login_id=key, cache=cli_sso_session_cache)
 
@@ -2587,6 +2627,7 @@ async def cli_sso_callback(
             user_api_key_cache=user_api_key_cache,
             cli_sso_session_cache=cli_sso_session_cache,
             proxy_logging_obj=proxy_logging_obj,
+            litellm_jwtauth=litellm_jwtauth,
             prefill_user_code=prefill_user_code,
             sso_assertion=sso_assertion,
         )
@@ -3567,7 +3608,8 @@ class SSOAuthenticationHandler:
     async def add_user_to_teams_from_sso_response(
         result: CustomOpenID | OpenID | dict | None,
         user_info: NewUserResponse | LiteLLM_UserTable | None,
-    ):
+        litellm_jwtauth: LiteLLM_JWTAuth | None = None,
+    ) -> None:
         """
         Adds the user as a team member to the teams specified in the SSO responses `team_ids` field
 
@@ -3577,8 +3619,15 @@ class SSOAuthenticationHandler:
         if user_info is None:
             verbose_proxy_logger.debug("User not found in LiteLLM DB, skipping team member addition")
             return
-        sso_teams: Final = result.team_ids if isinstance(result, CustomOpenID) else []
+        sso_teams: Final = result.team_ids if isinstance(result, CustomOpenID) else None
+        if sso_teams is None:
+            return
         await add_missing_team_member(user_info=user_info, sso_teams=sso_teams)
+        await remove_stale_team_members(
+            user_info=user_info,
+            sso_teams=sso_teams,
+            litellm_jwtauth=litellm_jwtauth,
+        )
 
     @staticmethod
     def verify_user_in_restricted_sso_group(
@@ -3603,7 +3652,7 @@ class SSOAuthenticationHandler:
             return True
         if isinstance(ui_access_mode, str):
             return True
-        team_ids: Final = getattr(result, "team_ids", [])
+        team_ids: Final = result.team_ids if isinstance(result, CustomOpenID) and result.team_ids is not None else []
 
         if ui_access_mode.get("type") == "restricted_sso_group":
             restricted_sso_group: Final = ui_access_mode.get("restricted_sso_group")
@@ -3870,6 +3919,7 @@ class SSOAuthenticationHandler:
             user_email=user_email,
             user_defined_values=user_defined_values,
             alternate_user_id=user_id,
+            litellm_jwtauth=jwt_handler.litellm_jwtauth if jwt_handler is not None else None,
         )
 
         # Sync user role from JWT claims via jwt_litellm_role_map (if configured).
@@ -4667,7 +4717,7 @@ class MicrosoftSSOHandler:
     @staticmethod
     def openid_from_response(
         response: dict | None,
-        team_ids: list[str],
+        team_ids: list[str] | None,
         user_role: LitellmUserRoles | None,
     ) -> CustomOpenID:
         response = response or {}
@@ -4742,7 +4792,7 @@ class MicrosoftSSOHandler:
     @staticmethod
     async def get_user_groups_from_graph_api(
         access_token: str | None = None,
-    ) -> list[str]:
+    ) -> list[str] | None:
         """
         Returns a list of `team_ids` the user belongs to from the Microsoft Graph API
 
@@ -4750,7 +4800,7 @@ class MicrosoftSSOHandler:
             access_token (Optional[str]): Microsoft Graph API access token
 
         Returns:
-            List[str]: List of group IDs the user belongs to
+            List[str] | None: Group IDs when available, otherwise None
         """
         try:
             async_client: Final = get_async_httpx_client(llm_provider=httpxSpecialProvider.SSO_HANDLER)
@@ -4792,6 +4842,7 @@ class MicrosoftSSOHandler:
                     "Reached maximum page limit of %s. Some groups may not be included.",
                     MicrosoftSSOHandler.MAX_GRAPH_API_PAGES,
                 )
+                return None
 
             # If service_principal_group_ids is not empty, only return group_ids that are in both all_group_ids and service_principal_group_ids
             if service_principal_group_ids and len(service_principal_group_ids) > 0:
@@ -4801,7 +4852,7 @@ class MicrosoftSSOHandler:
 
         except Exception as e:
             verbose_proxy_logger.error("Error getting user groups from Microsoft Graph API: %s", e)
-            return []
+            return None
 
     @staticmethod
     async def fetch_and_parse_groups(
@@ -4809,6 +4860,7 @@ class MicrosoftSSOHandler:
     ) -> tuple[list[str], str | None]:
         """Helper function to fetch and parse group data from a URL"""
         response: Final = await async_client.get(url, headers=headers)
+        response.raise_for_status()
         response_json: Final[dict[str, object]] = response.json()
         response_typed: Final = await MicrosoftSSOHandler._cast_graph_api_response_dict(response=response_json)
         group_ids: Final = MicrosoftSSOHandler._get_group_ids_from_graph_api_response(response=response_typed)

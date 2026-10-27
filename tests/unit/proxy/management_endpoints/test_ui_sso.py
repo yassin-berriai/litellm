@@ -17,10 +17,10 @@ from fastapi import HTTPException, Request
 import litellm
 from litellm._uuid import uuid
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
-from litellm.proxy._types import LiteLLM_UserTable, NewUserResponse, ProxyException
+from litellm.proxy._types import LiteLLM_JWTAuth, LiteLLM_UserTable, NewUserResponse, ProxyException
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.management_endpoints.sso import CustomMicrosoftSSO
-from litellm.proxy.management_endpoints.types import CustomOpenID
+from litellm.proxy.management_endpoints.types import CustomOpenID, OpenID
 from litellm.proxy.management_endpoints.ui_sso import (
     GoogleSSOHandler,
     MicrosoftSSOHandler,
@@ -525,6 +525,45 @@ async def test_get_user_groups_empty_response():
 
 
 @pytest.mark.asyncio
+async def test_get_user_groups_non_success_response_returns_none(
+    httpx_transport: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MICROSOFT_SERVICE_PRINCIPAL_ID", raising=False)
+    graph_url: Final = MicrosoftSSOHandler.get_graph_api_user_groups_endpoint()
+    with respx.mock:
+        route = respx.get(url=graph_url).mock(
+            return_value=httpx.Response(
+                503,
+                json={"error": {"code": "ServiceUnavailable", "message": "Unavailable"}},
+            )
+        )
+
+        result: Final = await MicrosoftSSOHandler.get_user_groups_from_graph_api(access_token="mock_token")
+
+    assert result is None
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_truncation_returns_none(
+    httpx_transport: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MICROSOFT_SERVICE_PRINCIPAL_ID", raising=False)
+    graph_url: Final = MicrosoftSSOHandler.get_graph_api_user_groups_endpoint()
+    with respx.mock:
+        route = respx.get(url=graph_url).mock(
+            return_value=httpx.Response(200, json={"value": [], "@odata.nextLink": graph_url})
+        )
+        with patch.object(MicrosoftSSOHandler, "MAX_GRAPH_API_PAGES", 2):
+            result: Final = await MicrosoftSSOHandler.get_user_groups_from_graph_api(access_token="mock_token")
+
+    assert result is None
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_get_user_groups_error_handling():
     # Arrange
     async def mock_get(*args, **kwargs):
@@ -542,8 +581,27 @@ async def test_get_user_groups_error_handling():
         )
 
         # Assert
-        assert isinstance(result, list)
-        assert len(result) == 0
+        assert result is None
+
+
+def test_verify_user_in_restricted_sso_group_rejects_unknown_team_ids() -> None:
+    result: Final = CustomOpenID(
+        id="alice",
+        email="alice@example.com",
+        team_ids=None,
+    )
+
+    with pytest.raises(ProxyException, match="not in the restricted SSO group"):
+        SSOAuthenticationHandler.verify_user_in_restricted_sso_group(
+            general_settings={
+                "ui_access_mode": {
+                    "type": "restricted_sso_group",
+                    "restricted_sso_group": "team-a",
+                }
+            },
+            result=result,
+            received_response=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -6557,6 +6615,99 @@ class TestPKCEFunctionality:
 
 
 # Tests for SSO user team assignment bug (Issue: SSO Users Not Added to Entra-Synced Teams on First Login)
+@pytest.mark.parametrize(
+    ("result", "litellm_jwtauth", "expected_adds", "expected_removals"),
+    [
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=["team-a"]),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True),
+            (),
+            ("team-b",),
+            id="remove-stale-team",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=[]),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True),
+            (),
+            ("team-a", "team-b"),
+            id="remove-all-teams-from-authoritative-empty-list",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=[]),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True, fallback_to_db_teams=True),
+            (),
+            None,
+            id="preserve-db-teams-with-empty-claims",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=["team-a"]),
+            LiteLLM_JWTAuth(),
+            (),
+            None,
+            id="sync-disabled",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=["team-a"]),
+            None,
+            (),
+            None,
+            id="jwt-auth-unavailable",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=None),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True),
+            (),
+            None,
+            id="unknown-team-claims",
+        ),
+        pytest.param(
+            OpenID(id="alice", email="alice@example.com", provider="google"),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True),
+            (),
+            None,
+            id="plain-openid",
+        ),
+        pytest.param(
+            CustomOpenID(id="alice", email="alice@example.com", team_ids=["team-a", "team-c"]),
+            LiteLLM_JWTAuth(sync_user_role_and_teams=True),
+            ("team-c",),
+            ("team-b",),
+            id="add-and-remove-memberships",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sso_team_sync_reconciles_memberships(  # test-quality-ok: SCIM and add calls are the membership effects
+    result: CustomOpenID | OpenID,
+    litellm_jwtauth: LiteLLM_JWTAuth | None,
+    expected_adds: tuple[str, ...],
+    expected_removals: tuple[str, ...] | None,
+) -> None:
+    user_info: Final = LiteLLM_UserTable(user_id="alice", teams=["team-a", "team-b"])
+    mock_add_task: Final = AsyncMock()
+    mock_patch_membership: Final = AsyncMock(return_value=True)
+
+    with (
+        patch("litellm.proxy.management_endpoints.ui_sso.create_team_member_add_task", mock_add_task),
+        patch("litellm.proxy.management_endpoints.scim.scim_v2.patch_team_membership", mock_patch_membership),
+    ):
+        await SSOAuthenticationHandler.add_user_to_teams_from_sso_response(
+            result=result,
+            user_info=user_info,
+            litellm_jwtauth=litellm_jwtauth,
+        )
+
+    assert tuple(call.args[0] for call in mock_add_task.call_args_list) == expected_adds
+    if expected_removals is None:
+        mock_patch_membership.assert_not_awaited()
+    else:
+        mock_patch_membership.assert_awaited_once_with(
+            user_id="alice",
+            teams_ids_to_add_user_to=[],
+            teams_ids_to_remove_user_from=list(expected_removals),
+        )
+
+
 class TestAddMissingTeamMember:
     """Tests for the add_missing_team_member function"""
 

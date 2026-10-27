@@ -240,6 +240,7 @@ class JWTHandler:
 
     prisma_client: PrismaClient | None
     user_api_key_cache: UserApiKeyCache
+    litellm_jwtauth: LiteLLM_JWTAuth
     # Supported algos: https://pyjwt.readthedocs.io/en/stable/algorithms.html
     # "Warning: Make sure not to mix symmetric and asymmetric algorithms that interpret
     #   the key in different ways (e.g. HS* and RS*)."

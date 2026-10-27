@@ -19,7 +19,7 @@ from fastapi import HTTPException, Request
 
 pytest.importorskip("onelogin", reason="python3-saml (saml extra) is required for SAML SSO tests")
 
-from typing import cast
+from typing import Final, cast
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -583,6 +583,53 @@ async def test_team_ids_extracted_from_groups_attribute(saml_env_idp_initiated):
 
     result = await _acs(_b64(resp), _shared_cache())
     assert result.team_ids == ["team-a", "team-b"]
+
+
+@pytest.mark.parametrize(
+    ("attributes", "team_attribute_override", "expected_team_ids"),
+    [
+        pytest.param(
+            {"email": ["alice@example.com"]},
+            None,
+            None,
+            id="no-team-attribute",
+        ),
+        pytest.param(
+            {"email": ["alice@example.com"], "groups": ["team-a", "team-b"]},
+            None,
+            ["team-a", "team-b"],
+            id="candidate-attribute-with-values",
+        ),
+        pytest.param(
+            {"email": ["alice@example.com"], "groups": []},
+            None,
+            [],
+            id="candidate-attribute-with-empty-values",
+        ),
+        pytest.param(
+            {"email": ["alice@example.com"], "custom-groups": ["team-a"]},
+            "custom-groups",
+            ["team-a"],
+            id="configured-attribute-override",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_saml_team_ids_are_unknown_only_when_attribute_is_missing(
+    saml_env_idp_initiated: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    attributes: dict[str, list[str]],
+    team_attribute_override: str | None,
+    expected_team_ids: list[str] | None,
+) -> None:
+    key_pem, cert_pem = saml_env_idp_initiated
+    if team_attribute_override is not None:
+        monkeypatch.setenv("SAML_ATTRIBUTE_TEAM_IDS", team_attribute_override)
+
+    response: Final = _build_signed_response(key_pem, cert_pem, attributes=attributes)
+    result: Final = await _acs(_b64(response), _shared_cache())
+
+    assert result.team_ids == expected_team_ids
 
 
 @pytest.mark.asyncio

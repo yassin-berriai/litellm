@@ -27,7 +27,7 @@ import hashlib
 import os
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Final, cast
 from urllib.parse import parse_qsl
 
@@ -501,7 +501,7 @@ class SAMLAuthHandler:
         role_values: Final = SAMLAuthHandler._attribute_values(
             attributes, "SAML_ATTRIBUTE_ROLE", _ROLE_ATTRIBUTE_CANDIDATES
         )
-        team_ids: Final = SAMLAuthHandler._attribute_values(
+        team_ids: Final = SAMLAuthHandler._attribute_values_or_none(
             attributes, "SAML_ATTRIBUTE_TEAM_IDS", _TEAM_IDS_ATTRIBUTE_CANDIDATES
         )
 
@@ -544,10 +544,23 @@ class SAMLAuthHandler:
         env_override: str,
         candidates: tuple[str, ...],
     ) -> list[str]:
+        return SAMLAuthHandler._attribute_values_or_none(attributes, env_override, candidates) or []
+
+    @staticmethod
+    def _attribute_values_or_none(
+        attributes: Mapping[str, Sequence[str]],
+        env_override: str,
+        candidates: tuple[str, ...],
+    ) -> list[str] | None:  # mutable-ok: CustomOpenID.team_ids requires list-valued SAML claims
+        keys: Final = SAMLAuthHandler._attribute_keys(env_override, candidates)
+        if not any(key in attributes for key in keys):
+            return None
+        return next(
+            ([value for value in attributes[key] if value] for key in keys if attributes.get(key)),
+            [],
+        )
+
+    @staticmethod
+    def _attribute_keys(env_override: str, candidates: tuple[str, ...]) -> tuple[str, ...]:
         override: Final = SAMLAuthHandler._env(env_override)
-        keys: Final = (override, *candidates) if override else candidates
-        for key in keys:
-            values = attributes.get(key)
-            if values:
-                return [v for v in values if v]
-        return []
+        return (override, *candidates) if override else candidates

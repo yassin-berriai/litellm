@@ -1721,7 +1721,7 @@ class NewUserResponse(GenerateKeyResponse):
         ]
         | None
     ) = None
-    teams: list | None = None
+    teams: list[str] | None = None
     user_alias: str | None = None
     model_max_budget: dict | None = None
     created_at: datetime | None = None
