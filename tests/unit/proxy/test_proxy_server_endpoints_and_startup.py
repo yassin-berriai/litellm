@@ -10,13 +10,12 @@ import subprocess
 import sys
 import time
 import types
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Final
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, call, create_autospec, mock_open, patch
-
-from tests.unit.proxy.router_entry_point_stubs import route_entry_points_to_stubs
 
 import click
 import fastapi.routing
@@ -47,11 +46,12 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.login_throttle import LoginThrottle
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.banner import LITELLM_BANNER
 from litellm.proxy.hooks.parallel_request_limiter_v3 import RequestRateLimiterStash
 from litellm.proxy.proxy_server import app, aws_error_type_exception_handler, initialize, openai_exception_handler
 from litellm.utils import _invalidate_model_cost_lowercase_map
-from litellm.proxy.common_utils.banner import LITELLM_BANNER
 from tests._master_key import MASTER_KEY
+from tests.unit.proxy.router_entry_point_stubs import route_entry_points_to_stubs
 
 PUBLICLY_KNOWN_KEY: Final = "sk-" + "1234"
 
@@ -9840,6 +9840,7 @@ class _FakeLitellmConfig:
         self.rows = dict(initial_rows or {})
         self.upsert_calls: list = []
         self.find_first = AsyncMock(side_effect=self._find_first)
+        self.find_unique = AsyncMock(side_effect=self._find_first)
         self.upsert = AsyncMock(side_effect=self._upsert)
 
     async def _find_first(self, where=None):
@@ -9874,6 +9875,10 @@ class _FakePrismaClient:
             else _LaggingReplicaLitellmConfig(replica_rows, writer=self.writer_db.litellm_config)
         )
         self.jsonify_object = lambda obj: obj
+
+    @contextlib.asynccontextmanager
+    async def tx(self) -> AsyncIterator[types.SimpleNamespace]:
+        yield types.SimpleNamespace(litellm_config=self.writer_db.litellm_config, query_raw=AsyncMock())
 
 
 @pytest.fixture

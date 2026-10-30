@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
 if TYPE_CHECKING:
@@ -26,7 +27,10 @@ class _ConfigRow(Protocol):
     def reload_revision(self) -> int | None: ...
 
 
-class _ConfigTable(Protocol):
+CONFIG_SECTION_LOCK_SQL: Final = "SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))"
+
+
+class ConfigTable(Protocol):
     async def find_unique(self, *, where: Mapping[str, str]) -> _ConfigRow | None: ...
 
     async def find_many(self) -> Sequence[_ConfigRow]: ...
@@ -38,6 +42,17 @@ class _ConfigTable(Protocol):
 
 class _ConfigDatabase(Protocol):
     async def query_raw(self, query: str, *args: object) -> object: ...
+
+
+def _as_config_table(table: object) -> ConfigTable:
+    return cast(ConfigTable, table)
+
+
+@asynccontextmanager
+async def locked_config_section(prisma_client: PrismaClient, param_name: str) -> AsyncGenerator[ConfigTable]:
+    async with prisma_client.tx() as tx:
+        await tx.query_raw(CONFIG_SECTION_LOCK_SQL, param_name)
+        yield _as_config_table(tx.litellm_config)
 
 
 class ConfigParam:
@@ -62,12 +77,12 @@ class ConfigRepository:
         return self._prisma_client
 
     @property
-    def _config_table(self) -> _ConfigTable:
+    def _config_table(self) -> ConfigTable:
         database: Final = self.prisma_client.writer_db if self._use_writer else self.prisma_client.db
-        return cast(_ConfigTable, database.litellm_config)
+        return _as_config_table(database.litellm_config)
 
     @property
-    def table(self) -> _ConfigTable:
+    def table(self) -> ConfigTable:
         return self._config_table
 
     async def get_param(self, param_name: str) -> ConfigParam | None:

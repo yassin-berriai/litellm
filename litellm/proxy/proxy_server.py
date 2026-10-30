@@ -980,6 +980,7 @@ from litellm.proxy.utils import (  # noqa: F401, RUF100  # legacy module exports
 )
 from litellm.proxy.video_endpoints.endpoints import router as video_router
 from litellm.repositories.base_repository import SupportsModelDump
+from litellm.repositories.config_repository import CONFIG_SECTION_LOCK_SQL, ConfigRepository, locked_config_section
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.responses.streaming_iterator import drain_logging_tasks
@@ -5495,7 +5496,6 @@ def should_load_db_object(object_type: str | SupportedDBObjectType) -> bool:
 _CONFIG_PERSISTED_SECTIONS: Final = ("general_settings", "router_settings", "litellm_settings")
 _CONFIG_UNMANAGED_EXCLUSIONS: Final = frozenset(("environment_variables", "model_list"))
 _CONFIG_SECTION_VALUES: Final = TypeAdapter(Mapping[str, JsonValue])
-_CONFIG_SECTION_LOCK_SQL: Final = "SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))"
 
 
 class _ConfigParamWhere(TypedDict):
@@ -6029,7 +6029,7 @@ class ProxyConfig:
         prisma_client: PrismaClient,
     ) -> Mapping[str, JsonValue] | None:
         async with prisma_client.tx() as tx:
-            await tx.query_raw(_CONFIG_SECTION_LOCK_SQL, section_name)
+            await tx.query_raw(CONFIG_SECTION_LOCK_SQL, section_name)
             config_table: Final = cast("TableActions[_ConfigParamRow]", tx.litellm_config)
             config_where: Final[_ConfigParamWhere] = {"param_name": section_name}
             existing_row: Final[_ConfigParamRow | None] = await config_table.find_first(where=config_where)
@@ -14698,7 +14698,6 @@ from litellm.llms.anthropic.count_tokens.token_counter import AnthropicTokenCoun
 from litellm.llms.base_llm.base_utils import BaseTokenCounter
 from litellm.llms.openai.responses.count_tokens.token_counter import OpenAITokenCounter
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
-from litellm.repositories.config_repository import ConfigRepository
 from litellm.repositories.model_repository import ModelRepository
 from litellm.repositories.table_repositories import (
     AccessGroupRepository,
@@ -19869,10 +19868,30 @@ async def update_config(
 
         # router_settings: merge existing + request, request wins.
         if isinstance(raw_router_settings, dict):
-            existing = await _read_section("router_settings")
-            before_router_settings: Final = copy.deepcopy(existing)
-            new_router_settings: Final = {**existing, **router_settings_updates}
-            await _upsert_section("router_settings", new_router_settings)
+            async with locked_config_section(prisma_client, "router_settings") as table:
+                row: Final = await table.find_unique(where={"param_name": "router_settings"})
+                stored_router_settings: Final = (
+                    json.loads(row.param_value)
+                    if row is not None and isinstance(row.param_value, str)
+                    else row.param_value
+                    if row is not None
+                    else {}
+                )
+                before_router_settings: Final = dict(
+                    _CONFIG_SECTION_VALUES.validate_python(
+                        stored_router_settings if isinstance(stored_router_settings, Mapping) else {}
+                    )
+                )
+                new_router_settings: Final = {**before_router_settings, **router_settings_updates}
+                serialized_router_settings: Final = json.dumps(new_router_settings)
+                await table.upsert(
+                    where={"param_name": "router_settings"},
+                    data={
+                        "create": {"param_name": "router_settings", "param_value": serialized_router_settings},
+                        "update": {"param_value": serialized_router_settings},
+                    },
+                )
+            await invalidate_config_param("router_settings")
             asyncio.create_task(
                 create_config_audit_log(
                     "router_settings", "updated", before_router_settings, new_router_settings, user_api_key_dict

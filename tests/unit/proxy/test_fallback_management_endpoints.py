@@ -8,9 +8,11 @@ Tests:
 4. Validation tests (invalid models, duplicate fallbacks, etc.)
 """
 
+import asyncio
 import copy
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager
 from types import MappingProxyType, SimpleNamespace
 from typing import Final, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,8 +21,10 @@ import pytest
 from fastapi import HTTPException
 from pydantic import JsonValue, TypeAdapter
 from redis.exceptions import NoPermissionError
+from starlette.requests import Request
 
 from litellm import Router
+from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.config_resolvers.settings_rules import Section
 from litellm.proxy.management_endpoints.fallback_management_endpoints import (
     FallbackCreateRequest,
@@ -30,7 +34,7 @@ from litellm.proxy.management_endpoints.fallback_management_endpoints import (
     delete_fallback,
     get_fallback,
 )
-from litellm.proxy.proxy_server import ProxyConfig
+from litellm.proxy.proxy_server import ConfigYAML, ProxyConfig, update_config
 from litellm.proxy.utils import evict_config_param, get_config_param, litellm_config_cache
 from litellm.router_api import ChangeSet
 from litellm.router_api import RouterSettings as RouterSettingsSnapshot
@@ -184,6 +188,7 @@ class TestCreateFallbackForTeamScopedModels:
         client.writer_db = client.db
         client.db.litellm_config.find_unique = AsyncMock(return_value=None)
         client.db.litellm_config.upsert = AsyncMock()
+        _configure_transactions(client)
         client.get_generic_data = AsyncMock(return_value=None)
         return client
 
@@ -268,6 +273,25 @@ def _config_row(router_settings: RouterSettings) -> SimpleNamespace:
     return SimpleNamespace(param_name="router_settings", param_value=router_settings)
 
 
+@asynccontextmanager
+async def _fake_transaction(client: MagicMock, lock: asyncio.Lock) -> AsyncIterator[SimpleNamespace]:
+    async def query_raw(query: str, param_name: str) -> None:
+        if "pg_advisory_xact_lock(hashtext($1))" in query and param_name == "router_settings":
+            await lock.acquire()
+
+    query: Final = AsyncMock(side_effect=query_raw)
+    try:
+        yield SimpleNamespace(litellm_config=client.writer_db.litellm_config, query_raw=query)
+    finally:
+        if query.await_count:
+            lock.release()
+
+
+def _configure_transactions(client: MagicMock) -> None:
+    lock: Final = asyncio.Lock()
+    client.tx.side_effect = lambda **_: _fake_transaction(client, lock)
+
+
 class _ConfigFileProxyConfig(ProxyConfig):
     def __init__(self, config_file: RouterSettings | None = None) -> None:
         super().__init__()
@@ -293,14 +317,20 @@ class _StoredRouterSettings:
         self.prisma_client.get_generic_data = AsyncMock(
             side_effect=lambda value, **_: self.row if value == "router_settings" else None
         )
-        self.prisma_client.writer_db.litellm_config.find_unique = AsyncMock(
-            side_effect=lambda **_: copy.deepcopy(self.row)
-        )
+        self.prisma_client.writer_db.litellm_config.find_unique = AsyncMock(side_effect=self._read)
         self.prisma_client.db.litellm_config.find_unique = AsyncMock(
             side_effect=lambda **_: None if lagging_replica else copy.deepcopy(self.row)
         )
         self.prisma_client.db.litellm_config.upsert = AsyncMock(side_effect=self._upsert)
+        self.prisma_client.writer_db.litellm_config.upsert = self.prisma_client.db.litellm_config.upsert
+        _configure_transactions(self.prisma_client)
         self.proxy_config: Final = _ConfigFileProxyConfig(config_file)
+
+    async def _read(self, **_: object) -> SimpleNamespace | None:
+        snapshot: Final = copy.deepcopy(self.row)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return snapshot
 
     async def _upsert(self, where: dict[str, str], data: dict[str, dict[str, str]]) -> None:
         self.row = _config_row(json.loads(data["update"]["param_value"]))
@@ -338,6 +368,62 @@ class _RedisThatRefusesDel:
 
     async def async_delete_cache(self, key: str) -> None:
         raise NoPermissionError("this user has no permissions to run the 'del' command")
+
+
+@pytest.fixture
+def concurrent_fallback_store() -> Iterator[_StoredRouterSettings]:
+    stored: Final = _StoredRouterSettings(None)
+    router: Final = Router(
+        model_list=[{"model_name": f"m{i}", "litellm_params": _litellm_params(None)} for i in range(1, 7)]
+    )
+    with (
+        patch("litellm.proxy.proxy_server.llm_router", router),
+        patch("litellm.proxy.proxy_server.prisma_client", stored.prisma_client),
+        patch("litellm.proxy.proxy_server.proxy_config", stored.proxy_config),
+        patch("litellm.proxy.proxy_server.store_model_in_db", True),
+    ):
+        yield stored
+
+
+async def test_concurrent_creates_keep_every_committed_rule(concurrent_fallback_store: _StoredRouterSettings) -> None:
+    await asyncio.gather(
+        *(
+            create_fallback(FallbackCreateRequest(model=f"m{i}", fallback_models=["m6"]), UserAPIKeyAuth())
+            for i in range(1, 6)
+        )
+    )
+
+    assert concurrent_fallback_store.stored_fallbacks() == [{f"m{i}": ["m6"]} for i in range(1, 6)]
+
+
+async def test_concurrent_deletes_keep_every_committed_removal(
+    concurrent_fallback_store: _StoredRouterSettings,
+) -> None:
+    concurrent_fallback_store.written_by_another_instance({"fallbacks": [{f"m{i}": ["m6"]} for i in range(1, 6)]})
+
+    await asyncio.gather(*(delete_fallback(f"m{i}", "general", UserAPIKeyAuth()) for i in range(1, 6)))
+
+    assert concurrent_fallback_store.stored_fallbacks() == []
+
+
+async def test_concurrent_config_update_and_fallback_keep_both_changes(
+    concurrent_fallback_store: _StoredRouterSettings,
+) -> None:
+    stored: Final = concurrent_fallback_store
+    body: Final = {"router_settings": {"routing_strategy": "least-busy"}}
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": json.dumps(body).encode()}
+
+    request: Final = Request({"type": "http", "method": "POST", "path": "/config/update"}, receive)
+    with patch.object(stored.proxy_config, "add_deployment", AsyncMock()):
+        await asyncio.gather(
+            update_config(ConfigYAML(**body), request, UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)),
+            create_fallback(FallbackCreateRequest(model="m1", fallback_models=["m6"]), UserAPIKeyAuth()),
+        )
+
+    assert stored.row is not None
+    assert stored.row.param_value == {"routing_strategy": "least-busy", "fallbacks": [{"m1": ["m6"]}]}
 
 
 class TestFallbackWritesSeeTheLatestStoredRules:
@@ -647,6 +733,7 @@ class TestCreateFallback:
         client.db.litellm_config.upsert = AsyncMock()
         client.get_generic_data = AsyncMock(return_value=None)
         client.jsonify_object = lambda x: x
+        _configure_transactions(client)
         return client
 
     @pytest.fixture
@@ -692,10 +779,7 @@ class TestCreateFallback:
             assert response.model == "gpt-3.5-turbo"
             assert response.fallback_models == ["gpt-4", "claude-3-haiku"]
             assert response.fallback_type == "general"
-            assert (
-                "created" in response.message.lower()
-                or "updated" in response.message.lower()
-            )
+            assert "created" in response.message.lower() or "updated" in response.message.lower()
 
             # Verify database was updated
             mock_prisma_client.db.litellm_config.upsert.assert_called_once()
@@ -963,6 +1047,7 @@ class TestDeleteFallback:
         client.db.litellm_config.upsert = AsyncMock()
         client.get_generic_data = AsyncMock(return_value=None)
         client.jsonify_object = lambda x: x
+        _configure_transactions(client)
         return client
 
     @pytest.fixture
